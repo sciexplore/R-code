@@ -1,0 +1,747 @@
+# 2/23/2021
+
+# Stuck at around line 225, really not right, need to be clear about 
+# how train/test works with cross validation
+# do cross-validation in train
+# then when confident have done all training use best model
+# in test set, this isn't really an example of that.
+
+# It started focused on getting betas and predictions, instead of 
+# entire workflow.  What I wanted to see was how to extract the betas at
+# each point in the workflow.  Maybe that's not realistic.
+
+# So, do entire workflow again and then add betas, predictions, saving models
+# and getting saved models and making predictions from new models again.
+
+# but, really need to understand tidymodels instead of just pattern matching
+
+
+###################################################+
+#
+# Example using tidymodels to find best 
+# logistic regression with lasso and
+# a single hyperparameter, penalty.
+#
+# Using simulated data.
+#
+# (A) First find best hyperparamter using just the training dataset.
+#     (i.e. without test set)
+#     This is the example copied from stackexchange.
+#     (this is likely quite optimistically biased,
+#     as described in 2018 article p. 7)
+#
+# (B) Next, extend example to use training and test set
+#     to find best penalty hyperparamter 
+#     (this is likely to be pessimistically biased, because
+#     not all the data is used to select the best 
+#     hyperparamter, but it is better than A, and may be
+#     the best estimate of the generalization error -- need to check this)
+#
+# (C) Apply the hyperparamter selected from B to the
+#     training and test data to generate the best model.
+#
+# (D) Export the model as 
+#     1) Numerical betas that can be used to predict 
+#        new data using any platform (PMML, SAS, etc...)
+#     2) A binary R object that can be used to generate 
+#        predictions from a cloud server (if the cloud server runs R)
+#
+###################################################
+
+
+#
+# All the examples use the same simulated data.
+#
+# y = outcome
+# x1 = predictor related to y
+# x2, x3 = predictors unrelated to y
+#
+# for lasso regression we expect betas for x2 and x3 to be zero,
+# because they are unrelated to y (outcome).
+#
+
+library(tidymodels)  
+#library(tidypredict) # for making predictions from models
+#library(yaml) # for saving/reading model
+library(tidyverse)
+library(ROCR)
+setwd("~/sasgprod_home/nas/git_repository/SRI/consult/tidymodel_example_code")
+
+# simulated data (x1 is related to outcome y, x2 and x3 are not related to outcome y)
+set.seed(1234)
+n = 1000
+data_all <- tibble(y = factor(sample(c(0,1), n, replace = TRUE)),
+                x1 = as.numeric(y) + rnorm(n),
+                x2 = rnorm(n),
+                x3 = rnorm(n)
+)
+
+
+# use initial_split to create training/test datasets
+splits = initial_split(data_all, strata = y, prop=0.8)
+
+# this extracts the training dataset as defined in initial split (80% of data stratified to have y same % as in all_data)
+data_train = training(splits) 
+
+# this extracts the test (holdout) as defined in initial split (20% of data stratified to have y same % as in all_data)
+data_holdout = testing(splits) 
+
+
+lr_cv = vfold_cv(data_train, v=5) # split training data for cross-validation (5-fold)
+
+
+
+########################################################################################
+#
+# (A) Logistic regression with LASSO, in single training set
+#     select penalty that gives highest AUC (quite optimistically biased).
+#     Here as the starting point for next steps (an example of the shortest workflow).
+#
+########################################################################################
+
+
+# Follows this stack-exchange on how to extract coefficients and save results
+# https://stackoverflow.com/questions/63087592/how-to-extract-glmnet-coefficients-produced-by-tidymodels
+# think same person as earlier rec (Julia Silge @ RStudio)
+# She says the coefficients can be saved as numerical values or:
+
+#line 109 - 114 is where we play with parameters and ML models
+lr_grid <- tibble(penalty = c(0, 10^seq(-4, 1, length.out = 5))); lr_grid 
+# set up grid of penalties to search over, penalty=0 is no lasso, just plain logistic regression
+
+lr_mod <- logistic_reg(penalty = tune(), mixture = 1) %>% # mixture=1 is lasso; mixture=0 ridge; mixture = 0.5 is between lasso and ridge 
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+lr_wf <- workflow() %>%
+  add_model(lr_mod) %>%
+  add_formula(y ~ .) 
+
+lr_best <- lr_wf %>%
+  tune_grid(
+    resamples = lr_cv,
+    grid = lr_grid
+  ) %>%
+  select_best("roc_auc")
+
+model_A = lr_wf %>% 
+  finalize_workflow(lr_best) %>%
+  fit(data_train) %>%  
+  pull_workflow_fit()
+
+betas_A = model_A %>% tidy()
+
+betas_A
+# Note: the best penalty for lasso does 
+# set betas (estimate) for x2 and x3 to zero
+# as expected
+#>  term        estimate penalty
+#>  <chr>          <dbl>   <dbl>
+#>  (Intercept)   -1.22   0.0316
+#>  x1             0.785  0.0316
+#>  x2             0      0.0316
+#>  x3             0      0.0316
+
+# So, the equation to use based on this approach 
+# (highly optimistically biased approach) is:
+
+# y_hat = -1.22 + (0.785)x1
+
+# (x2 and x3 have zero betas, so they are not in the question).
+
+
+#
+# Below is not part of Julie's code, it show's the AUCs
+# for the 6 penalties searched over.
+# Again, the highest choice (0.744) is an optimistic estimate.
+
+lr_res <- lr_wf %>%
+  tune_grid(
+    resamples = lr_cv,
+    grid = lr_grid,
+    control = control_grid(save_pred = TRUE),
+    metrics = metric_set(roc_auc)
+  ) 
+
+rankAUC = lr_res %>% show_best(n=nrow(lr_grid)); rankAUC 
+#   penalty .metric .estimator  mean     n std_err .config             
+# 1  0.0316  roc_auc binary     0.744     5  0.0198 Preprocessor1_Model4
+# 2  0.00178 roc_auc binary     0.740     5  0.0211 Preprocessor1_Model3
+# 3  0       roc_auc binary     0.740     5  0.0211 Preprocessor1_Model1
+# 4  0.0001  roc_auc binary     0.740     5  0.0211 Preprocessor1_Model2
+# 5  0.562   roc_auc binary     0.5       5  0      Preprocessor1_Model5
+# 6 10       roc_auc binary     0.5       5  0      Preprocessor1_Model6
+rankAUC$mean # more decimal points for mean
+# shows some variation between penalty=0.00178 and penalty=0 (penalty=0 is just plain logistic regression, w/o lasso)
+# but no difference between penalty=0 and penalty=0.0001 
+# and no difference between penalty=0.562 and penalty=10 (they're terrible, both 0.5)
+# [1] 0.7442851 0.7399420 0.7399108 0.7399108 0.5000000 0.5000000
+
+
+
+
+########################################################################################
+#
+# (B) If confident with results in training test set
+#     break into holdout test set using the best penalty hyperparamter (0.0316)
+#     to generate the betas to use for estimating the generalization error.
+#
+#     The 2018 articles says this is likely to be somewhat 
+#     pessimistically biased, because not all the data is used to generate the betas, 
+#     but it is better than the approach in A.
+#
+#     In the case of this admittedly odd simulated data 
+#     the AUC is higher (0.812 compared to 0.744), but perhaps this could be 
+#     pessimistic and the other could be optimistic, if neither are meaningful in an
+#     absolute sense?
+#
+########################################################################################
+
+
+# model with highest AUC is model 4
+lr_best_parm = lr_res %>%
+  select_best("roc_auc"); lr_best_parm
+# penalty .config             
+# 0.0316 Preprocessor1_Model4
+
+#
+# SELECTED MODEL
+#
+final_wf = lr_wf %>% 
+  finalize_workflow(lr_best_parm)
+final_wf
+
+break_into_holdout = final_wf %>%
+  last_fit(splits)
+
+# get AUC in holdout dataset
+break_into_holdout %>%
+  collect_metrics()
+# .metric  .estimator .estimate .config             
+# accuracy binary     0.734 Preprocessor1_Model1
+# roc_auc  binary     0.812 Preprocessor1_Model1
+
+
+# above results look ok, run full dataset with
+# hyperparameter = 0.0316
+# to get final betas 
+# (is it true that AUC on full dataset isn't meaningful?)
+
+# use all data with best parameter
+model_B = final_wf %>% 
+  finalize_workflow(lr_best_parm) %>%
+  fit(data_all) %>%
+  pull_workflow_fit() 
+
+betas_B = model_B %>% tidy()
+
+betas_B
+# term        estimate penalty
+# 1 (Intercept)   -1.30   0.0316
+# 2 x1             0.834  0.0316
+# 3 x2             0      0.0316
+# 4 x3             0      0.0316
+
+# could predict using new dataset on model_B
+# predict(model_B, newdata= add_new_data)
+
+library(ROCR)
+
+
+
+
+
+
+
+
+prd = predict(model_A, data_holdout[, -1], type="prob")[, 2] %>% pull()
+
+source("~/consult/ITAN/calibration_plots.R")
+proc_peter.plots(as.numeric(data_holdout$y)-1, prd, T)
+
+
+#
+# get predictions from model with best estimated generalization error
+#
+# check, same as above
+pROC::auc(data_holdout$y, prd) # 0.8121
+
+
+########################################################################################
+#
+# (C) Apply the hyperparamter selected from B to the
+#     training and test data to generate the best model.
+#
+########################################################################################
+
+
+# already did this in B?
+
+
+
+########################################################################################
+#
+# (D) Export the model as 
+#     1) Numerical betas that can be used to predict 
+#        new data using any platform (PMML, SAS, etc...)
+#     2) A binary R object that can be used to generate 
+#        predictions from a cloud server (if the cloud server runs R)
+#
+########################################################################################
+
+
+#     1) Numerical betas that can be used to predict 
+#        new data using any platform (PMML, SAS, etc...)
+#        Only a possibility for simple models, like logistic reg
+#        not really an option for tree-based, neural net or boosted models
+
+
+write_csv(betas_A[, c("term", "estimate")], "log_reg_lasso_model_A.csv")
+# saves to many more decimal places
+betas_A$estimate # -1.2209096  0.7851013  0.0000000  0.0000000
+
+
+#     2) A binary R object that can be used to generate 
+#        predictions from a cloud server (if the cloud server runs R)
+
+
+# can just use save(), load()
+# of save
+
+save(rf_fit, file='Mymod.RData')
+load('Mymod.RData')
+
+#The other option would be using saveRDS() to save the model and then use readRDS() to load it but it requires to be allocated in an object:
+saveRDS(rf_fit, file = "Mymod.rds")
+# Restore the object
+rf_fit <- readRDS(file = "Mymod.rds")
+
+# then use predict() to generate model predictions
+
+
+# examples of saving as generic binary R object here:
+https://stackoverflow.com/questions/64397754/how-to-save-a-parsnip-model-fit-from-ranger
+
+# There is also library(tidypredict) which has parse_model
+# which writes out as yamml file, see webpage below,
+# but I could not get it to work, nothing seemed to be 
+# a model object, even the workflow_fit model object wasn't right
+
+# to write out model in a format so it can be read in 
+# and used to predict, write out in yaml format.
+
+https://tidypredict.tidymodels.org/articles/save.html
+
+model <- lm(mpg ~ (wt + disp) * cyl, data = mtcars)
+# The parse_model() function allows to run the first step manually. It will return an R list object which contains all of the needed information to produce a prediction calculation. The structure of the parsed model varies based on what kind of model is being processed. In general, it is consistent in what kind of information it expects from each model type. For example, in the example the lm() model object will return variables such as sigma2, which would not be used in other model types, such as decision trees.
+
+library(tidypredict)
+
+parsed <- parse_model(model)
+str(parsed, 2)
+
+tidypredict_fit(parsed)
+
+library(yaml)
+
+write_yaml(parsed, "my_model.yml")
+# Re-load the model
+# In a new R session, we can read the YAML file into our environment.
+
+library(tidypredict)
+library(yaml)
+
+loaded_model <- read_yaml("my_model")
+
+loaded_model <- as_parsed_model(loaded_model)
+
+
+#The preview of the file looks exactly as the preview of the original parsed model.
+str(loaded_model, 2)
+
+tidypredict is able to read the new R variable and use it to create the formula.
+
+tidypredict_fit(loaded_model)
+#> 53.5256637 + (wt * -6.381546) + (disp * -0.0458427) + (cyl * 
+#>     -3.6302557) + (wt * cyl * 0.5356044) + (disp * cyl * 0.0054062)
+#The same variable can be used with other tidypredict functions, such as tidypredict_sql()
+
+tidypredict_sql(loaded_model, dbplyr::simulate_odbc())
+#> <SQL> 53.5256637 + (`wt` * -6.381546) + (`disp` * -0.0458427) + (`cyl` * -3.6302557) + (`wt` * `cyl` * 0.5356044) + (`disp` * `cyl` * 0.0054062)
+#broom
+#The parsed_model object integrates with tidy() from broom.
+
+tidy(loaded_model)
+#> # A tibble: 6 x 2
+#>   term        estimate
+#>   <chr>          <dbl>
+#> 1 (Intercept) 53.5    
+#> 2 wt          -6.38   
+#> 3 disp        -0.0458 
+#> 4 cyl         -3.63   
+#> 5 wt:cyl       0.536  
+#> 6 disp:cyl     0.00541
+
+
+
+
+######################################## earlier
+#
+# Use tidymodels to find best parameters  for 
+# boost_tree (using xgboost engine)
+#
+library(tidymodels)  
+library(tictoc)
+library(readr)       
+library(readxl)
+
+# ITAN test data is here if you've cloned the repo consult on the ACI
+DATA_DIR = "~/sasgprod_home/rsch/sri/projects/ITAN/consult"
+# if you cloned the repo to your O drive then use
+# DATA_DIR = "o:/rsch/sri/projects/ITAN/consult"
+
+# read in data
+icu_raw = read_excel(file.path(DATA_DIR, "icu_48hr_itan.xlsx"))
+dim(icu_raw) # 24315 299
+#names(icu_raw)[1:90]
+
+
+# set up variables
+# must remove elapsed_wsi_hr (it is equal to 48 for all MRNs)
+# similarly remove elapsed_hr (mostly 48, a few others due to intervening icu/or units)
+icu = icu_raw %>%
+  select(-PH_TYPE, -ADM_TIME, -LAPS2_HOUR,
+         -elapsed_hr, -elapsed_wsi_hr) %>%
+  mutate(DLONGLOS = factor(DLONGLOS),
+         #ADM_TIME = as_datetime(ADM_TIME, format="%d%b%Y:%T"),
+         #LAPS2_HOUR = as_datetime(LAPS2_HOUR, format="%d%b%Y:%T"),
+         MALE = factor(MALE),
+         DAY_OF_WEEK_ADM = factor(DAY_OF_WEEK_ADM),
+         DAY_OF_WEEK_HR = factor(DAY_OF_WEEK_HR),
+         ENTER_VIA_ED = factor(ENTER_VIA_ED),
+         ADMIT_FULL_CODE = factor(ADMIT_FULL_CODE),
+         HOURLY_FULL_CODE = factor(HOURLY_FULL_CODE))
+
+# remove all the avg_, min_, max_ variables
+# see if it completes
+names(icu)
+icu = icu[, 1:81]
+names(icu)
+
+
+sum(is.na(icu)) # 0, no missing data
+
+# set up train/test (80/20)
+# test is final hold out dataset
+set.seed(123)
+splits = initial_split(icu, strata = DLONGLOS, prop=0.8)
+
+# this is the traing dataset (do 5-fold cv and hyperparameter selection in this)
+data_train = training(splits) # data_other will be split into training and validation for parameter tuning
+
+# this is final out test set, only use after 
+# completely satisfied with 
+# model developed in data_train
+data_holdout = testing(splits) 
+
+#
+# create 5-fold cross validation structure to use 
+# when training to identify hyperparameters 
+# in training dataset
+#
+set.seed(234)
+tr_folds = vfold_cv(data_train, v=5, strata=DLONGLOS)
+
+
+
+# 
+# BUILD THE MODEL
+# To specify a penalized logistic regression model that uses a feature selection penalty, 
+# let's use the parsnip package with the glmnet engine:
+show_engines("logistic_reg")
+#   engine mode          
+# 1 glm    classification
+# 2 glmnet classification
+# 3 spark  classification
+# 4 keras  classification
+# 5 stan   classification
+
+library(glmnet)
+args(glmnet)
+#
+# tidymodel changes alpha to mixture
+# and uses penalty to set penalty
+#
+trace.it = 0, ...) 
+#
+# CREATE THE RECIPE (outcome, data)
+#
+lrl_recipe =
+  recipe(DLONGLOS ~ ., data = data_train) %>%
+  update_role(ENCOUNTER_ID, new_role = "ID") %>%  
+  step_dummy(all_nominal(), -all_outcomes()) # need to add this to use categorical variables)
+
+#
+# CREATE THE MODEL, identify parameters to tune by
+# setting equal to tune()
+#
+
+lrl_mod <- 
+  logistic_reg(mixture = 1, penalty = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+#
+# CREATE WORKFLOW: bundle model and recipe
+#
+lrl_workflow <- 
+  workflow() %>% 
+  add_model(lrl_mod) %>% 
+  add_recipe(lrl_recipe)
+
+
+lrl_grid <- tibble(penalty = c(0, 10^seq(-4, 1, length.out = 5)))
+
+lrl_res <- lrl_workflow %>%
+  tune_grid(
+    resamples = tr_folds,
+    grid = lrl_grid,
+    control = control_grid(save_pred = TRUE),
+    metrics = metric_set(roc_auc)
+  ) 
+
+lrl_res %>% show_best(n=nrow(lrl_grid)) 
+
+lrl_best = lrl_res %>%
+  select_best("roc_auc")
+
+best_auc = lrl_workflow %>% 
+  finalize_workflow(lrl_best) %>%
+  fit(data_train) %>%
+  pull_workflow_fit() 
+
+train_coefs = lrl_workflow %>% 
+  finalize_workflow(lrl_best) %>%
+  fit(data_train) %>%
+  pull_workflow_fit() %>%
+  tidy()
+
+#
+# train_ceofs are best coefficients in model with best auc
+# but not final coefficients, get final coefficients 
+# after 
+# 1) break into hold out and confirm that result is not
+#    wildly wrong (in this case, AUC is actually better 
+#    when include hold out -- because more data?)
+# 2) when passes step 1) above 
+#    re-run model and get coefficients for implementation.
+#
+
+
+#
+# RESULT
+#
+# single outcome of 5-fold cv in training dataset
+#
+collect_metrics(lrl_res)
+#   penalty .metric .estimator  mean     n std_err .config             
+# 1  0       roc_auc binary     0.654     5 0.00355 Preprocessor1_Model1
+# 2  0.0001  roc_auc binary     0.654     5 0.00355 Preprocessor1_Model2
+# 3  0.00178 roc_auc binary     0.655     5 0.00392 Preprocessor1_Model3
+# 4  0.0316  roc_auc binary     0.637     5 0.00569 Preprocessor1_Model4
+# 5  0.562   roc_auc binary     0.5       5 0       Preprocessor1_Model5
+# 6 10       roc_auc binary     0.5       5 0       Preprocessor1_Model6
+
+# best model is model 3
+lr_best_parm = lrl_res %>%
+  select_best("roc_auc"); lr_best_parm
+# penalty .config             
+# 0.00178 Preprocessor1_Model3
+
+#
+# SELECTED MODEL
+#
+final_wf = lrl_workflow %>% 
+  finalize_workflow(lr_best_parm)
+final_wf
+
+#
+# betas in selected model
+# using training data
+#
+betas_selected_model = final_wf %>% 
+  finalize_workflow(lr_best_parm) %>%
+  fit(data_train) %>%
+  pull_workflow_fit() %>%
+  tidy()
+
+tbetas = betas_selected_model$estimate
+names(tbetas) = betas_selected_model$term
+tnzbetas = tbetas[tbetas!=0]; tnzbetas
+
+
+#
+# Calibration of selected model before break into holdout dataset.
+#
+# For logistic regression with lasso 
+#
+selected_fit = final_wf %>% 
+  fit_resamples(tr_folds, control=control_resamples(save_pred = T))
+selected_fit
+
+# get predictions using training dataset
+selected_preds = selected_fit %>%
+  collect_predictions()
+
+# use predictions from training dataset to make calibration curves
+# and get sens, spec, ppv, nne to compare with other models
+# before select final model type (these factors plus AUC may be used by PI in decision making)
+source("~/consult/ITAN/calibration_plots.R")
+addmargins(table(as.numeric(selected_preds$DLONGLOS)-1, 
+                 as.numeric(selected_preds[, 3][[1]] < 0.5)))
+
+# maybe set prediction threshold much lower
+proc_peter.plots(as.numeric(selected_preds$DLONGLOS)-1, 
+                 selected_preds[, 3][[1]], T)
+
+
+###################################################
+#
+# Once ready to break into hold out dataset
+# code below shows best estimate of how model will
+# perform on new data.
+#
+# Use last_fit() on the original split
+# this will take the best hyperparameters, 
+# apply them  to the training data to crezate 
+# a model and then see how that model
+# performs on the holdout test data.
+#
+###################################################
+
+break_into_holdout_fit = final_wf %>%
+  last_fit(splits)
+
+# get AUC in holdout dataset
+break_into_holdout_fit %>%
+  collect_metrics()
+# .metric  .estimator .estimate .config             
+# accuracy binary     0.706 Preprocessor1_Model1
+# roc_auc  binary     0.670 Preprocessor1_Model1
+
+# get predictions in holdout dataset
+holdout_preds = break_into_holdout_fit %>%
+  collect_predictions()
+
+
+library(ROCR)
+#
+# get predictions from model with best estimated generalization error
+#
+# check, same as above
+pROC::auc(holdout_preds$DLONGLOS, holdout_preds[, 3][[1]])
+# 0.6696
+
+#
+# calibration plots from model with 
+# best estimated generalization error
+# not good, compared to logitic regression with lasso
+#
+addmargins(table(as.numeric(holdout_preds$DLONGLOS)-1, 
+                 as.numeric(holdout_preds[, 3][[1]] < 0.5)))
+
+# set prediction threshold much lower
+proc_peter.plots(as.numeric(holdout_preds$DLONGLOS)-1, 
+                 holdout_preds[, 3][[1]], T)
+
+
+#
+# after verifying that breaking into the hold out dataset
+# shows results are ok
+# get final coefficients (betas) by using all data (in this case 'icu')
+
+
+betas_all_data = final_wf %>% 
+  finalize_workflow(lr_best_parm) %>%
+  fit(icu) %>%
+  pull_workflow_fit() %>%
+  tidy()
+
+betas_all_data
+#    term         estimate penalty
+# 1 (Intercept) -2.60     0.00178
+# 2 AGE          0        0.00178
+# 3 ADM_LAPS2   -0.000623 0.00178
+# 4 ADM_COPS2    0.00204  0.00178
+# 5 OT_A_GROUP  -0.0165   0.00178
+# 6 OT_B_GROUP   0.124    0.00178
+# 7 OT_D_GROUP   0.0601   0.00178
+# 8 OT_I_GROUP   0.176    0.00178
+# 9 OT_L_GROUP   0.0144   0.00178
+# 10 OT_N_GROUP  -0.00623  0.00178
+# . with 80 more rows
+fbetas = betas_all_data$estimate
+names(fbetas) = betas_all_data$term
+fnzbetas = fbetas[fbetas!=0]; fnzbetas
+# (Intercept)                  ADM_LAPS2                  ADM_COPS2                 OT_A_GROUP                 OT_B_GROUP 
+# -2.6003940027              -0.0006233481               0.0020425413              -0.0165095706               0.1241102544 
+# OT_D_GROUP                 OT_I_GROUP                 OT_L_GROUP                 OT_N_GROUP             IMAR_INH_GROUP 
+# 0.0600796084               0.1758048867               0.0143516868              -0.0062288029              -0.0199604042 
+# IMAR_IVR_GROUP             IMAR_IVD_GROUP             IMAR_MSC_GROUP              IMAR_OR_GROUP                  OT_A_PREV 
+# 0.0248986295               0.0387436704              -0.0279809285              -0.0261962408              -0.0348417861 
+# OT_B_PREV                  OT_I_PREV               IMAR_IM_PREV              IMAR_IVR_PREV              IMAR_IVD_PREV 
+# -0.0728225280               0.0659144911              -0.0606159709               0.0362795174               0.0462111824 
+# IMAR_MSC_PREV               IMAR_OR_PREV                    EASYPAT                    HEALTHY                   U_ADMITS 
+# -0.1074193576              -0.0111219916              -0.2431440831              -0.1595638829               0.0015545272 
+# U_DISCHARGE                  U_AVG_AGE                  B_HANDOFF                   BUSIEST1                   BUSIEST2 
+# -0.0144058217               0.0034460554               0.0018079885               0.0545084217               0.0529689952 
+# BUSIEST3                   BUSIEST4                   BUSIEST5                   BUSIEST6               HOURLY_LAPS2 
+# 0.0869531572               0.0166320538               0.0156094266               0.0148937593               0.0051963216 
+# enc_dyn_order_mar_sum_t    enc_dyn_order_mar_sum_w        unt_dyn_laps_max_ex     unt_dyn_laps_n_high_ex        unt_dyn_crash_sum_w 
+# -0.0002604659               0.0044576563               0.0004440252               0.0113556029              -0.0528911739 
+# unt_dyn_died_sum_wd       enc_dyn_laps_1st_dif enc_dyn_laps_dif_frm_start     enc_dyn_laps_dif_frm_w enc_dyn_laps_max_1st_dif_w 
+# 0.0418845850              -0.0038790677               0.0068404680              -0.0006917115              -0.0001400503 
+# nw_dyn_rn_4h_max_laps     nw_dyn_rn_4h_unq_touch                    MALE_X1          DAY_OF_WEEK_HR_X2          DAY_OF_WEEK_HR_X3 
+# 0.0007234359               0.0209666293              -0.0317315190              -0.0166286047              -0.0659663626 
+# DAY_OF_WEEK_HR_X4             ENTER_VIA_ED_Y         ADMIT_FULL_CODE_X1        HOURLY_FULL_CODE_X1 
+# -0.0634712324               0.5208493832               0.0420921466               0.0548271797 
+
+
+# compare variables in final and training model
+length(fnzbetas) # 54
+length(tnzbetas) # 50
+
+# betas in final model, not in training model
+setdiff(names(fnzbetas), names(tnzbetas))
+# [1] "IMAR_MSC_GROUP"             "OT_B_PREV"                 
+# [3] "B_HANDOFF"                  "BUSIEST4"                  
+# [5] "BUSIEST5"                   "enc_dyn_laps_max_1st_dif_w"
+# [7] "DAY_OF_WEEK_HR_X2"     
+
+# betas in training model, not in final model
+setdiff(names(tnzbetas), names(fnzbetas))
+# [1] "B_SICKEST3"                 "enc_dyn_laps_max_1st_dif_t"
+# [3] "DAY_OF_WEEK_HR_X7" 
+
+
+tbm = function(threshold) {
+  addmargins(table(as.numeric(data_holdout$y)-1, 
+                   as.numeric(prd < threshold))) }
+tbm(threshold)
+
+# maybe set prediction threshold much lower
+# function to find optimal thresh
+find_threshold = function(threshold) {
+  tbm=tbm(threshold)
+  (tbm[1,1]+tbm[2,2])/tbm[3,3] # accuracy
+}
+res = optimize(find_threshold, c(0.1, 0.9), maximum=T); res
+# $maximum
+# [1] 0.1648301
+# $objective
+# [1] 0.4773869
+tbm(res$maximum)
+#       0   1 Sum
+# 0    93   9 102
+# 1    95   2  97
+# Sum 188  11 199
